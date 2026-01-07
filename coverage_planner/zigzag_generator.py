@@ -13,7 +13,7 @@ class ZigzagGenerator(Node):
         # マージンパラメータ (ロボットの半径 + 安全余裕)
         # ロボットサイズ 500mm x 500mm -> 半径約 35cm (対角線/2) または 幅/2 = 25cm
         # 進入禁止エリア(コーン)に当たらないように、少し大きめのマージンを取る
-        self.declare_parameter('safety_margin', 0.6) 
+        self.declare_parameter('safety_margin', 0.45) # デフォルト 45cm (変更) 
 
         # /cone_area トピックをサブスクライブ
         self.subscription = self.create_subscription(
