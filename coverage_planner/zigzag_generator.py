@@ -60,6 +60,42 @@ class ZigzagGenerator(Node):
         path_msg = Path()
         path_msg.header = msg.header
         
+        # アプローチ用ウェイポイントの追加
+        # 最初のライン始点の手前に、スムーズにアプローチするためのウェイポイントを配置
+        first_intersections = self.get_line_intersections(inner_polygon, min_x)
+        if len(first_intersections) >= 2:
+            first_intersections.sort()
+            first_y = first_intersections[0]  # 最初のライン始点のY座標
+            first_x = min_x # 最初のライン始点のX座標
+
+            # 重心を計算
+            centroid_x, centroid_y = self.calculate_centroid(inner_polygon)
+            
+            # アプローチ用ウェイポイント: 始点から重心に向かって少し戻った位置
+            # ベクトル (Start -> Centroid)
+            dx = centroid_x - first_x
+            dy = centroid_y - first_y
+            dist_to_centroid = math.hypot(dx, dy)
+            
+            approach_dist = 1.0 # 1m手前からアプローチ
+            if dist_to_centroid < approach_dist:
+                approach_dist = dist_to_centroid * 0.8 # 重心より遠い場合は重心付近にする
+            
+            if dist_to_centroid > 1e-6:
+                # Start から Centroid 方向へ approach_dist だけ移動した点 = Approach Point
+                # ベクトルは (dx, dy) なので、正規化して approach_dist を掛ける
+                ax = first_x + (dx / dist_to_centroid) * approach_dist
+                ay = first_y + (dy / dist_to_centroid) * approach_dist
+                
+                # 向きの計算: アプローチポイント(ax, ay) -> 始点(first_x, first_y)
+                # つまりベクトルは (first_x - ax, first_y - ay)
+                dir_x = first_x - ax
+                dir_y = first_y - ay
+                
+                # アプローチウェイポイントを追加
+                path_msg.poses.append(self.create_pose(ax, ay, msg.header, dir_x, dir_y))
+                self.get_logger().info(f'Added approach waypoint at ({ax:.2f}, {ay:.2f}) inside polygon')
+        
         current_x = min_x
         direction = 1  # 1: Up (min_y -> max_y), -1: Down (max_y -> min_y)
 
@@ -134,7 +170,6 @@ class ZigzagGenerator(Node):
             x = x1 + t * (x2 - x1)
             y = y1 + t * (y2 - y1)
             path_msg.poses.append(self.create_pose(x, y, header, direction_x, direction_y))
-        self.get_logger().info(f'Published path with {len(path_msg.poses)} waypoints.')
 
     def create_pose(self, x, y, header, direction_x=1.0, direction_y=0.0):
         """
@@ -258,6 +293,18 @@ class ZigzagGenerator(Node):
                 intersections.append(y)
                 
         return intersections
+
+    def calculate_centroid(self, points):
+        x = 0.0
+        y = 0.0
+        num = len(points)
+        if num == 0:
+            return 0.0, 0.0
+            
+        for p in points:
+            x += p.x
+            y += p.y
+        return x / num, y / num
 
 def main(args=None):
     rclpy.init(args=args)
