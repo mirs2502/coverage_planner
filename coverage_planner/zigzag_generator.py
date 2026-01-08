@@ -9,11 +9,10 @@ class ZigzagGenerator(Node):
         super().__init__('zigzag_generator')
         
         # パラメータの宣言 (ロボットの幅 = ジグザグの間隔)
-        self.declare_parameter('robot_width', 0.3)  # デフォルト 30cm
+        self.declare_parameter('robot_width', 0.5)  # 0.3 -> 0.5 (密度緩和)
         # マージンパラメータ (ロボットの半径 + 安全余裕)
-        # ロボットサイズ 500mm x 500mm -> 半径約 35cm (対角線/2) または 幅/2 = 25cm
-        # 進入禁止エリア(コーン)に当たらないように、少し大きめのマージンを取る
-        self.declare_parameter('safety_margin', 0.45) # デフォルト 45cm (変更) 
+        # インフレーション半径(0.3m) + 対角線半径(0.354m) + オーバーシュート(0.1m) = 0.754m
+        self.declare_parameter('safety_margin', 0.75) # 0.45 -> 0.75 
 
         # /cone_area トピックをサブスクライブ
         self.subscription = self.create_subscription(
