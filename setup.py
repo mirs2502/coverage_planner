@@ -26,6 +26,7 @@ entry_points={
         'console_scripts': [
             'dummy_area_publisher = coverage_planner.dummy_area_publisher:main',
             'zigzag_generator = coverage_planner.zigzag_generator:main',
+            'rectangle_generator = coverage_planner.rectangle_generator:main',
         ],
     },
 )
