@@ -29,12 +29,13 @@ class ZigzagGenerator(Node):
     def area_callback(self, msg: PolygonStamped):
         """
         多角形エリアを受信し、ジグザグ経路を生成するコールバック関数
+        最長辺に沿った方向でジグザグを生成する
         """
         self.get_logger().info('Received polygon area. Generating path...')
-        
+
         robot_width = self.get_parameter('robot_width').get_parameter_value().double_value
         margin = self.get_parameter('safety_margin').get_parameter_value().double_value
-        
+
         if robot_width <= 0:
             self.get_logger().error('robot_width must be greater than 0')
             return
@@ -46,105 +47,177 @@ class ZigzagGenerator(Node):
 
         # 1. ポリゴンを縮小 (Offset Polygon)
         inner_polygon = self.offset_polygon(points, margin)
-        
+
         if not inner_polygon or len(inner_polygon) < 3:
             self.get_logger().warn('Inner polygon is invalid or too small (margin might be too large).')
             return
 
-        # 2. 縮小したポリゴンの範囲 (AABB) を計算
-        min_x = min(p.x for p in inner_polygon)
-        max_x = max(p.x for p in inner_polygon)
-        
-        # 3. ジグザグ経路 (Path) のウェイポイントを生成
+        # 2. 最長辺を見つけて、その方向を基準軸とする
+        sweep_angle = self.find_longest_edge_angle(inner_polygon)
+        self.get_logger().info(f'Sweep angle (longest edge): {math.degrees(sweep_angle):.1f} degrees')
+
+        # 3. ポリゴンを回転して軸に揃える
+        rotated_polygon = self.rotate_polygon(inner_polygon, -sweep_angle)
+
+        # 4. 回転後のポリゴンの範囲 (AABB) を計算
+        min_x = min(p.x for p in rotated_polygon)
+        max_x = max(p.x for p in rotated_polygon)
+
+        # 5. ジグザグ経路 (Path) のウェイポイントを生成
         path_msg = Path()
         path_msg.header = msg.header
-        
+
         # アプローチ用ウェイポイントの追加
-        # 最初のライン始点の手前に、スムーズにアプローチするためのウェイポイントを配置
-        first_intersections = self.get_line_intersections(inner_polygon, min_x)
+        first_intersections = self.get_line_intersections(rotated_polygon, min_x)
         if len(first_intersections) >= 2:
             first_intersections.sort()
-            first_y = first_intersections[0]  # 最初のライン始点のY座標
-            first_x = min_x # 最初のライン始点のX座標
+            first_y = first_intersections[0]
+            first_x = min_x
 
-            # 重心を計算
-            centroid_x, centroid_y = self.calculate_centroid(inner_polygon)
-            
-            # アプローチ用ウェイポイント: 始点から重心に向かって少し戻った位置
-            # ベクトル (Start -> Centroid)
+            centroid_x, centroid_y = self.calculate_centroid(rotated_polygon)
+
             dx = centroid_x - first_x
             dy = centroid_y - first_y
             dist_to_centroid = math.hypot(dx, dy)
-            
-            approach_dist = 1.0 # 1m手前からアプローチ
+
+            approach_dist = 1.0
             if dist_to_centroid < approach_dist:
-                approach_dist = dist_to_centroid * 0.8 # 重心より遠い場合は重心付近にする
-            
+                approach_dist = dist_to_centroid * 0.8
+
             if dist_to_centroid > 1e-6:
-                # Start から Centroid 方向へ approach_dist だけ移動した点 = Approach Point
-                # ベクトルは (dx, dy) なので、正規化して approach_dist を掛ける
                 ax = first_x + (dx / dist_to_centroid) * approach_dist
                 ay = first_y + (dy / dist_to_centroid) * approach_dist
-                
-                # 向きの計算: アプローチポイント(ax, ay) -> 始点(first_x, first_y)
-                # つまりベクトルは (first_x - ax, first_y - ay)
-                dir_x = first_x - ax
-                dir_y = first_y - ay
-                
-                # アプローチウェイポイントを追加
-                path_msg.poses.append(self.create_pose(ax, ay, msg.header, dir_x, dir_y))
-                self.get_logger().info(f'Added approach waypoint at ({ax:.2f}, {ay:.2f}) inside polygon')
-        
+
+                # 回転座標系から元の座標系に戻す
+                ax_orig, ay_orig = self.rotate_point(ax, ay, sweep_angle)
+                fx_orig, fy_orig = self.rotate_point(first_x, first_y, sweep_angle)
+
+                dir_x = fx_orig - ax_orig
+                dir_y = fy_orig - ay_orig
+
+                path_msg.poses.append(self.create_pose(ax_orig, ay_orig, msg.header, dir_x, dir_y))
+                self.get_logger().info(f'Added approach waypoint at ({ax_orig:.2f}, {ay_orig:.2f})')
+
         current_x = min_x
-        direction = 1  # 1: Up (min_y -> max_y), -1: Down (max_y -> min_y)
+        direction = 1
 
         while current_x <= max_x:
-            # 現在の X 座標におけるポリゴンとの交点 (Y座標) を取得
-            intersections = self.get_line_intersections(inner_polygon, current_x)
-            
+            intersections = self.get_line_intersections(rotated_polygon, current_x)
+
             if len(intersections) >= 2:
-                # 交点をソート
                 intersections.sort()
-                
-                # 通常は2点交差 (凸多角形の場合)。
-                # 凹多角形の場合は複数のセグメントができる可能性があるが、
-                # ここでは最も外側の範囲、あるいは最大のセグメントを採用するなどの戦略が必要。
-                # 今回はコーンエリア(凸に近い)と仮定し、最小Yと最大Yを採用してその間を結ぶ。
-                # ただし、途中に穴がある場合は横断してしまうリスクがあるため、
-                # セグメントごとにパスを生成するのが理想。
-                # ここではシンプルに「偶数個の交点があれば、ペアごとにパスを引く」実装にする。
-                
-                # 交点が奇数の場合はエッジケース（頂点上など）なので、無視するか調整が必要
+
                 if len(intersections) % 2 != 0:
-                    # 頂点に接触した場合など。安全のためスキップまたは補正
                     pass
                 else:
-                    # ペアごとに処理 (凸なら1ペアのみ)
-                    # direction に応じて追加順序を変える
-                    
                     segments = []
                     for i in range(0, len(intersections), 2):
                         y_start = intersections[i]
                         y_end = intersections[i+1]
                         segments.append((y_start, y_end))
-                    
-                    if direction == 1:
-                        # 下から上へ
-                        for y_s, y_e in segments:
-                            # 始点と終点の間を補間して追加
-                            self.add_interpolated_poses(path_msg, current_x, y_s, current_x, y_e, msg.header)
-                    else:
-                        # 上から下へ
-                        for y_s, y_e in reversed(segments):
-                            # 始点と終点の間を補間して追加
-                            self.add_interpolated_poses(path_msg, current_x, y_e, current_x, y_s, msg.header)
 
-            # 次のラインへ
+                    if direction == 1:
+                        for y_s, y_e in segments:
+                            # 回転座標系から元の座標系に戻してから追加
+                            self.add_interpolated_poses_rotated(
+                                path_msg, current_x, y_s, current_x, y_e,
+                                msg.header, sweep_angle)
+                    else:
+                        for y_s, y_e in reversed(segments):
+                            self.add_interpolated_poses_rotated(
+                                path_msg, current_x, y_e, current_x, y_s,
+                                msg.header, sweep_angle)
+
             current_x += robot_width
             direction *= -1
 
         self.path_publisher_.publish(path_msg)
         self.get_logger().info(f'Published path with {len(path_msg.poses)} waypoints.')
+
+    def find_longest_edge_angle(self, polygon):
+        """
+        ポリゴンの最長辺の角度を返す
+        """
+        max_length = 0
+        angle = 0
+        num_points = len(polygon)
+
+        for i in range(num_points):
+            p1 = polygon[i]
+            p2 = polygon[(i + 1) % num_points]
+
+            dx = p2.x - p1.x
+            dy = p2.y - p1.y
+            length = math.hypot(dx, dy)
+
+            if length > max_length:
+                max_length = length
+                angle = math.atan2(dy, dx)
+
+        return angle
+
+    def rotate_point(self, x, y, angle):
+        """
+        点を原点周りに回転
+        """
+        cos_a = math.cos(angle)
+        sin_a = math.sin(angle)
+        new_x = x * cos_a - y * sin_a
+        new_y = x * sin_a + y * cos_a
+        return new_x, new_y
+
+    def rotate_polygon(self, polygon, angle):
+        """
+        ポリゴン全体を原点周りに回転
+        """
+        rotated = []
+        for p in polygon:
+            new_x, new_y = self.rotate_point(p.x, p.y, angle)
+            p_new = Point32()
+            p_new.x = float(new_x)
+            p_new.y = float(new_y)
+            p_new.z = 0.0
+            rotated.append(p_new)
+        return rotated
+
+    def add_interpolated_poses_rotated(self, path_msg, x1, y1, x2, y2, header, angle, resolution=0.3):
+        """
+        回転座標系の2点間を補間し、元の座標系に戻してpath_msgに追加
+        """
+        dist = math.hypot(x2 - x1, y2 - y1)
+        if dist < 1e-6:
+            ox, oy = self.rotate_point(x1, y1, angle)
+            path_msg.poses.append(self.create_pose(ox, oy, header, 1.0, 0.0))
+            return
+
+        num_points = int(dist / resolution)
+        if num_points < 1:
+            num_points = 1
+
+        for i in range(num_points + 1):
+            t = i / float(num_points)
+            x = x1 + t * (x2 - x1)
+            y = y1 + t * (y2 - y1)
+
+            # 元の座標系に戻す
+            ox, oy = self.rotate_point(x, y, angle)
+
+            # 次の点との方向を計算（最後の点は前の方向を維持）
+            if i < num_points:
+                next_x = x1 + (i + 1) / float(num_points) * (x2 - x1)
+                next_y = y1 + (i + 1) / float(num_points) * (y2 - y1)
+                next_ox, next_oy = self.rotate_point(next_x, next_y, angle)
+                dir_x = next_ox - ox
+                dir_y = next_oy - oy
+            else:
+                # 最後の点は前の方向を使う
+                prev_x = x1 + (num_points - 1) / float(num_points) * (x2 - x1)
+                prev_y = y1 + (num_points - 1) / float(num_points) * (y2 - y1)
+                prev_ox, prev_oy = self.rotate_point(prev_x, prev_y, angle)
+                dir_x = ox - prev_ox
+                dir_y = oy - prev_oy
+
+            path_msg.poses.append(self.create_pose(ox, oy, header, dir_x, dir_y))
 
     def add_interpolated_poses(self, path_msg, x1, y1, x2, y2, header, resolution=0.3):
         """

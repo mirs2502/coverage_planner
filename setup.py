@@ -27,6 +27,7 @@ entry_points={
             'dummy_area_publisher = coverage_planner.dummy_area_publisher:main',
             'zigzag_generator = coverage_planner.zigzag_generator:main',
             'rectangle_generator = coverage_planner.rectangle_generator:main',
+            'two_cone_reciprocate = coverage_planner.two_cone_reciprocate:main',
         ],
     },
 )
