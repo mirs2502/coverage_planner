@@ -10,8 +10,8 @@ class RectangleGenerator(Node):
         
         # パラメータの宣言
         # マージンパラメータ (ロボットの半径 + 安全余裕)
-        # インフレーション半径(0.3m) + 対角線半径(0.354m) + オーバーシュート(0.1m) = 0.754m
-        self.declare_parameter('safety_margin', 0.75)
+        # インフレーション半径(0.3m) のみを使用（より大きな経路を生成）
+        self.declare_parameter('safety_margin', 0.3)
 
         # /cone_area トピックをサブスクライブ
         self.subscription = self.create_subscription(
