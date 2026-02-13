@@ -65,11 +65,7 @@ class RectangleGenerator(Node):
         # 最長辺の始点と終点
         p_start_edge = inner_polygon[longest_edge_index]
         p_end_edge = inner_polygon[(longest_edge_index + 1) % num_points]
-        
-        # 最長辺の中点 (Start Point)
-        start_pt_x = (p_start_edge.x + p_end_edge.x) / 2.0
-        start_pt_y = (p_start_edge.y + p_end_edge.y) / 2.0
-        
+
         # 辺の方向ベクトル
         edge_len = max_dist
         if edge_len < 1e-6:
@@ -78,17 +74,21 @@ class RectangleGenerator(Node):
 
         dir_x = (p_end_edge.x - p_start_edge.x) / edge_len
         dir_y = (p_end_edge.y - p_start_edge.y) / edge_len
+
+        # 最長辺の端から1/4の位置 (Start Point) - より無理のないアプローチのため
+        start_pt_x = p_start_edge.x + dir_x * (edge_len * 0.25)
+        start_pt_y = p_start_edge.y + dir_y * (edge_len * 0.25)
         
         # アプローチポイント (Start Point から逆方向に approach_dist 戻る)
         # ただし、辺の始点 (p_start_edge) を超えないように制限する
-        # Start Point は中点なので、Start Point から p_start_edge までの距離は edge_len / 2
-        
-        dist_to_corner = edge_len / 2.0
+        # Start Point は端から1/4の位置なので、p_start_edge までの距離は edge_len * 0.25
+
+        dist_to_corner = edge_len * 0.25
         approach_dist = 1.0 # 希望するアプローチ距離
-        
+
         # 安全のため、コーナーより少し内側までしか戻らないようにする (マージン 0.2m)
         max_approach_dist = max(0.0, dist_to_corner - 0.2)
-        
+
         actual_approach_dist = min(approach_dist, max_approach_dist)
         
         approach_pt_x = start_pt_x - dir_x * actual_approach_dist
