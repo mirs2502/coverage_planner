@@ -2,16 +2,21 @@ import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import PolygonStamped, PoseStamped, Point32
 from nav_msgs.msg import Path
+from tf2_ros import Buffer, TransformListener, LookupException, ConnectivityException, ExtrapolationException
 import math
 
 class RectangleGenerator(Node):
     def __init__(self):
         super().__init__('rectangle_generator')
-        
+
         # パラメータの宣言
         # マージンパラメータ (ロボットの半径 + 安全余裕)
-        # インフレーション半径(0.3m) のみを使用（より大きな経路を生成）
-        self.declare_parameter('safety_margin', 0.3)
+        # インフレーション半径(0.3m) + 対角線半径(0.354m) + オーバーシュート(0.1m) = 0.754m
+        self.declare_parameter('safety_margin', 0.75)
+
+        # TF2 setup for robot pose
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
 
         # /cone_area トピックをサブスクライブ
         self.subscription = self.create_subscription(
@@ -19,10 +24,10 @@ class RectangleGenerator(Node):
             '/cone_area',
             self.area_callback,
             10)
-        
+
         # /coverage_path トピックに Path をパブリッシュ
         self.path_publisher_ = self.create_publisher(Path, '/coverage_path', 10)
-        
+
         self.get_logger().info('Rectangle Generator started. Waiting for /cone_area...')
 
     def area_callback(self, msg: PolygonStamped):
@@ -48,26 +53,71 @@ class RectangleGenerator(Node):
         # 2. 経路 (Path) のウェイポイントを生成
         path_msg = Path()
         path_msg.header = msg.header
-        
-        # 最長辺を見つける
+
+        # ロボットの現在位置と向きを取得
+        try:
+            transform = self.tf_buffer.lookup_transform(
+                msg.header.frame_id,  # target frame (usually 'map' or 'odom')
+                'base_link',          # source frame
+                rclpy.time.Time(),    # latest available
+                rclpy.duration.Duration(seconds=1.0))
+
+            robot_x = transform.transform.translation.x
+            robot_y = transform.transform.translation.y
+
+            # quaternion to yaw
+            qz = transform.transform.rotation.z
+            qw = transform.transform.rotation.w
+            robot_yaw = math.atan2(2.0 * (qw * qz), 1.0 - 2.0 * (qz * qz))
+
+            robot_dir_x = math.cos(robot_yaw)
+            robot_dir_y = math.sin(robot_yaw)
+
+            self.get_logger().info(f'Robot pose: ({robot_x:.2f}, {robot_y:.2f}), yaw: {robot_yaw:.2f} rad')
+
+        except (LookupException, ConnectivityException, ExtrapolationException) as e:
+            self.get_logger().warn(f'Could not get robot pose: {e}. Falling back to longest edge.')
+            # Fallback: 最長辺を使う
+            robot_x, robot_y = 0.0, 0.0
+            robot_dir_x, robot_dir_y = 1.0, 0.0
+
+        # ロボットの前方にある辺を見つける
         num_points = len(inner_polygon)
-        max_dist = -1.0
-        longest_edge_index = 0 # index of the start point of the longest edge
-        
+        max_dot_product = -999.0
+        forward_edge_index = 0
+
         for i in range(num_points):
             p1 = inner_polygon[i]
             p2 = inner_polygon[(i + 1) % num_points]
-            dist = math.hypot(p2.x - p1.x, p2.y - p1.y)
-            if dist > max_dist:
-                max_dist = dist
-                longest_edge_index = i
-                
-        # 最長辺の始点と終点
-        p_start_edge = inner_polygon[longest_edge_index]
-        p_end_edge = inner_polygon[(longest_edge_index + 1) % num_points]
 
-        # 辺の方向ベクトル
-        edge_len = max_dist
+            # 辺の中点
+            mid_x = (p1.x + p2.x) / 2.0
+            mid_y = (p1.y + p2.y) / 2.0
+
+            # ロボットから辺の中点へのベクトル
+            to_mid_x = mid_x - robot_x
+            to_mid_y = mid_y - robot_y
+
+            # 正規化
+            to_mid_len = math.hypot(to_mid_x, to_mid_y)
+            if to_mid_len < 1e-6:
+                continue
+            to_mid_x /= to_mid_len
+            to_mid_y /= to_mid_len
+
+            # ロボットの前方方向との内積
+            dot = robot_dir_x * to_mid_x + robot_dir_y * to_mid_y
+
+            if dot > max_dot_product:
+                max_dot_product = dot
+                forward_edge_index = i
+
+        # 前方の辺の始点と終点
+        p_start_edge = inner_polygon[forward_edge_index]
+        p_end_edge = inner_polygon[(forward_edge_index + 1) % num_points]
+
+        # 辺の長さと方向ベクトル
+        edge_len = math.hypot(p_end_edge.x - p_start_edge.x, p_end_edge.y - p_start_edge.y)
         if edge_len < 1e-6:
              self.get_logger().warn('Edge length is too small.')
              return
@@ -75,9 +125,9 @@ class RectangleGenerator(Node):
         dir_x = (p_end_edge.x - p_start_edge.x) / edge_len
         dir_y = (p_end_edge.y - p_start_edge.y) / edge_len
 
-        # 最長辺の端から1/4の位置 (Start Point) - より無理のないアプローチのため
-        start_pt_x = p_start_edge.x + dir_x * (edge_len * 0.25)
-        start_pt_y = p_start_edge.y + dir_y * (edge_len * 0.25)
+        # 前方の辺の真ん中 (Start Point)
+        start_pt_x = p_start_edge.x + dir_x * (edge_len * 0.5)
+        start_pt_y = p_start_edge.y + dir_y * (edge_len * 0.5)
         
         # アプローチポイント (Start Point から逆方向に approach_dist 戻る)
         # ただし、辺の始点 (p_start_edge) を超えないように制限する
@@ -102,8 +152,8 @@ class RectangleGenerator(Node):
         self.add_interpolated_poses(path_msg, start_pt_x, start_pt_y, p_end_edge.x, p_end_edge.y, msg.header)
         
         # 3. 残りの辺を一周
-        # longest_edge_index + 1 から順に回る
-        current_idx = (longest_edge_index + 1) % num_points
+        # forward_edge_index + 1 から順に回る
+        current_idx = (forward_edge_index + 1) % num_points
         
         for i in range(num_points - 1): # 最後の辺（戻ってくる辺）以外
             p_curr = inner_polygon[current_idx]
@@ -113,14 +163,14 @@ class RectangleGenerator(Node):
             current_idx = (current_idx + 1) % num_points
             
         # 4. 最後の辺の始点 -> スタートポイント (閉じる)
-        # current_idx は今 longest_edge_index になっているはず
+        # current_idx は今 forward_edge_index になっているはず
         p_last = inner_polygon[current_idx] # = p_start_edge
         self.add_interpolated_poses(path_msg, p_last.x, p_last.y, start_pt_x, start_pt_y, msg.header)
 
         self.path_publisher_.publish(path_msg)
         self.get_logger().info(f'Published rectangle path with {len(path_msg.poses)} waypoints.')
 
-    def add_interpolated_poses(self, path_msg, x1, y1, x2, y2, header, resolution=0.3):
+    def add_interpolated_poses(self, path_msg, x1, y1, x2, y2, header, resolution=0.1):
         """
         2点間 (x1, y1) -> (x2, y2) を resolution 間隔で補間し、path_msg に追加する
         """
